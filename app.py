@@ -1,270 +1,271 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS  # Import CORS from flask_cors
+from flask_cors import CORS
 import pandas as pd
-import numpy as np  # Add this import statement
+import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.preprocessing import StandardScaler
 from sklearn.inspection import permutation_importance
+from sklearn.metrics import accuracy_score, f1_score
 from sklearn.pipeline import make_pipeline
+import threading
+from threading import Lock  # Import Lock
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
-# Declare feature_importances as a global variable
 feature_importances = None
 model = None
 label_encoder = None
 X_train = None
 y_train = None
+cancel_prediction = False
+lock = Lock()  # Create a Lock
 
 def train_model():
     global model, label_encoder, feature_importances, X_train, y_train, X_test, y_test
 
-    # Load your datasets (replace 'your_data.csv' with your actual dataset names)
     data1 = pd.read_csv('/home/sir-derrick/Desktop/4.1/soil.csv')
     data2 = pd.read_csv('/home/sir-derrick/Desktop/4.1/soil1.csv')
     data = pd.read_csv('/home/sir-derrick/Desktop/4.1/sorted.csv')
 
-    # Assume 'crop_type' is the non-numeric target variable
     target_column = 'label'
 
-    # Use LabelEncoder to convert non-numeric target variable to numeric
     label_encoder = LabelEncoder()
     data[target_column] = label_encoder.fit_transform(data[target_column])
 
-    # Features and target variables
     features = data.drop(target_column, axis=1)
-
-    # Drop 'rainfall' and 'temperature' columns
     features = features.drop(['rainfall', 'temperature'], axis=1)
-
     target = data[target_column]
 
-    # Split the data into training and testing sets
     X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42)
 
-    # Create a machine learning pipeline with a RandomForestClassifier
     model = make_pipeline(StandardScaler(), RandomForestClassifier(n_estimators=100, random_state=42))
-    # Train the model on the entire dataset
     model.fit(features, target)
 
-    # Feature names
     feature_names = features.columns
-
-    # Get feature importances using permutation importance
     perm_importance = permutation_importance(model, features, target, n_repeats=30, random_state=42)
-
-    # Set feature_importances as a global variable
     feature_importances = dict(zip(feature_names, perm_importance.importances_mean))
-    
-# Call train_model at the beginning of the script or outside the predict route
-train_model()
-# Convert numpy.int64 to standard Python int
+
+# Start training the model in a separate thread
+train_thread = threading.Thread(target=train_model)
+train_thread.start()
+
 def convert_np_int64_to_int(value):
     if isinstance(value, np.int64):
         return int(value)
     elif isinstance(value, np.ndarray):
-        return value.tolist()  # Convert NumPy array to list
+        return value.tolist()
     elif isinstance(value, dict):
-        return {k: convert_np_int64_to_int(v) for k, v in value.items()}  # Recursively convert values in dictionaries
+        return {k: convert_np_int64_to_int(v) for k, v in value.items()}
     return value
 
-@app.route('/predict', methods=['POST'])
-def predict():
-    global model, label_encoder, feature_importances, X_train, y_train, X_test, y_test
+def calculate_improvements(current_value, target_value):
+    return target_value - current_value
 
-    try:
-        # Get data from the request
-        data = request.json.get('data')
+def perform_prediction(data):
+    global cancel_prediction
 
-        if not data:
-            raise ValueError("Invalid request format. 'data' key is missing.")
+    with lock:  # Acquire the lock
+        try:
+            if cancel_prediction:
+                cancel_prediction = False 
+                return {"message": "Prediction canceled"}
 
-        # Convert data to DataFrame
-        new_data = pd.DataFrame([data])  # <-- Remove the list wrapping
-        # Convert numpy.int64 values to int
-        new_data = new_data.applymap(convert_np_int64_to_int)
+            new_data = pd.DataFrame([data])
+            new_data = new_data.applymap(convert_np_int64_to_int)
 
-        # Convert non-numeric target variable to numeric
-        new_data['label'] = label_encoder.transform(['rice'])  # Assuming 'rice' is the label for the first row
-        # Make probability predictions for new data
-        probability_predictions = model.predict_proba(new_data.drop('label', axis=1))
+            if 'label' in new_data:
+                new_data['label'] = label_encoder.transform([new_data['label'].iloc[0]])
+            else:
+                new_data['label'] = 0
 
-        # Get the classes and their corresponding probabilities
-        classes = label_encoder.classes_
-        probabilities = probability_predictions[0]  # Assuming there's only one row of new data
+            if cancel_prediction:
+                cancel_prediction = False 
+                return {"message": "Prediction canceled"}
 
-        # Create a dictionary with crop labels and their probabilities
-        crop_probabilities = dict(zip(classes, probabilities))
+            probability_predictions = model.predict_proba(new_data.drop('label', axis=1))
 
-        # Set a threshold for predicted probabilities
-        threshold = 0.5
+            if cancel_prediction:
+                cancel_prediction = False 
+                return {"message": "Prediction canceled"}
 
-        # Filter crops with probabilities above the threshold
-        potential_crops = {crop: prob for crop, prob in crop_probabilities.items() if prob >= threshold}
+            classes = label_encoder.classes_
+            probabilities = probability_predictions[0]
+            crop_probabilities = dict(zip(classes, probabilities))
 
-        # Initialize response dictionary
-        response_data = {"success": True, "improvements": {}}
+            threshold = 0.5
+            potential_crops = {crop: prob for crop, prob in crop_probabilities.items() if prob >= threshold}
 
-        # Find the top predicted crop and its probability
-        top_crop = max(potential_crops, key=potential_crops.get, default=None)
-        top_probability = potential_crops.get(top_crop, 0.0)
+            response_data = {"success": True, "improvements": {}}
 
-        # Find the second highest predicted crop and its probability
-        sorted_crops = sorted(potential_crops, key=potential_crops.get, reverse=True)
-        second_crop = sorted_crops[1] if len(sorted_crops) > 1 else None
-        second_probability = potential_crops.get(second_crop, 0.0)
+            if cancel_prediction:
+                cancel_prediction = False 
+                return {"message": "Prediction canceled"}
 
-        # Check if the difference between top and second probabilities is below the threshold
-        if potential_crops and top_probability - second_probability < 0.2:
-            response_data["message"] = f"Consider improvements for {top_crop}."
+            top_crop = max(potential_crops, key=potential_crops.get, default=None)
+            top_probability = potential_crops.get(top_crop, 0.0)
 
-            # Get feature importances using permutation importance
-            perm_importance = permutation_importance(model, X_test, y_test, n_repeats=30, random_state=42)
+            if potential_crops and top_probability >= 0.5:
+                response_data["message"] = f"{top_crop} is the main crop that can be grown."
 
-            # Set feature_importances as a global variable
-            feature_importances = perm_importance.importances_mean
+                if cancel_prediction:
+                    cancel_prediction = False 
+                    return {"message": "Prediction canceled"}
 
-            # Feature names
-            feature_names = X_test.columns
+                feature_importances = permutation_importance(model, X_test, y_test, n_repeats=30, random_state=42).importances_mean
+                feature_names = X_test.columns
 
-            # Check if feature_importances is not None before using it
-            if feature_importances is not None:
-                # Find the features that significantly contribute to the prediction
-                significant_features = [(feature_names[i], feature_importances[i]) for i, importance in enumerate(feature_importances) if importance > 0]
+                if feature_importances is not None:
+                    significant_features = [(feature_names[i], feature_importances[i]) for i, importance in enumerate(feature_importances) if importance > 0]
 
-                if significant_features:
-                    response_data["improvements"][top_crop] = {"suggested_improvements": []}
+                    if significant_features:
+                        response_data["improvements"][top_crop] = {"probability": top_probability, "suggested_improvements": []}
 
-                    for feature, importance in significant_features:
-                        # Calculate the range of improvement (assuming normal distribution of feature values)
-                        std_dev = X_train[feature].std()
-                        improvement_range = std_dev * 0.5  # You can adjust the multiplier as needed
+                        for feature, _ in significant_features:
+                            target_value = X_train[feature].mean()
+                            current_value = new_data[feature].values[0]
+                            improvement = calculate_improvements(current_value, target_value)
 
-                        # Add specific recommendations for each feature to the response
-                        response_data["improvements"][top_crop]["suggested_improvements"].append({
-                            "feature": feature,
-                            "current_value": convert_np_int64_to_int(new_data[feature].values[0]),
-                            "improvement_range": improvement_range
-                        })
+                            response_data["improvements"][top_crop]["suggested_improvements"].append({
+                                "feature": feature,
+                                "current_value": convert_np_int64_to_int(current_value),
+                                "target_value": convert_np_int64_to_int(target_value),
+                                "improvement": convert_np_int64_to_int(improvement)
+                            })
+
+                    else:
+                        response_data["improvements"][top_crop]["message"] = "No specific improvement recommendations."
+
+                    if cancel_prediction:
+                        cancel_prediction = False 
+                        return {"message": "Prediction canceled"}
+
+                    alternative_crops = {crop: prob for crop, prob in crop_probabilities.items() if 0 < prob < 0.5}
+
+                    if alternative_crops:
+                        alternative_crops = dict(sorted(alternative_crops.items(), key=lambda item: item[1], reverse=True))
+                        response_data["alternative_crops"] = {}
+
+                        for alt_crop, alt_prob in alternative_crops.items():
+                            response_data["alternative_crops"][alt_crop] = {"probability": alt_prob, "suggested_improvements": []}
+
+                            if cancel_prediction:
+                                cancel_prediction = False 
+                                return {"message": "Prediction canceled"}
+
+                            alt_significant_features = permutation_importance(model, X_test, y_test, n_repeats=30, random_state=42).importances_mean
+                            feature_names = X_test.columns
+
+                            if alt_significant_features is not None:
+                                alt_significant_features = [(feature_names[i], alt_significant_features[i]) for i, importance in enumerate(alt_significant_features) if importance > 0]
+
+                            alt_crop = alt_crop
+
+                            if alt_significant_features:
+                                for feature, _ in alt_significant_features:
+                                    target_value = X_train[feature].mean()
+                                    current_value = new_data[feature].values[0]
+                                    improvement = calculate_improvements(current_value, target_value)
+
+                                    response_data["alternative_crops"][alt_crop]["suggested_improvements"].append({
+                                        "feature": feature,
+                                        "current_value": convert_np_int64_to_int(current_value),
+                                        "target_value": convert_np_int64_to_int(target_value),
+                                        "improvement": convert_np_int64_to_int(improvement)
+                                    })
+
+                            else:
+                                response_data["alternative_crops"][alt_crop]["message"] = "No specific improvement recommendations."
+
+                    else:
+                        response_data["message"] = "No alternative crops found with a higher probability threshold."
 
                 else:
-                    response_data["improvements"][top_crop]["message"] = "No specific improvement recommendations."
+                    response_data["message"] = "No feature importances available."
 
-                # Check for alternative crops with higher probability threshold
-                alternative_crops = {crop: prob for crop, prob in crop_probabilities.items() if 0 < prob < 0.5}  # Exclude crops with prob >= 0.5
+            else:
+                response_data["message"] = "Soil is not suitable for a crop with a 50% probability"
 
-                if alternative_crops:  # Check if alternative_crops is not empty
-                    # Sort alternative crops based on probabilities in descending order
+                if cancel_prediction:
+                    cancel_prediction = False 
+                    return {"message": "Prediction canceled"}
+
+                alternative_crops = {crop: prob for crop, prob in crop_probabilities.items() if 0 < prob < 0.5}
+
+                if alternative_crops:
                     alternative_crops = dict(sorted(alternative_crops.items(), key=lambda item: item[1], reverse=True))
                     response_data["alternative_crops"] = {}
 
                     for alt_crop, alt_prob in alternative_crops.items():
                         response_data["alternative_crops"][alt_crop] = {"probability": alt_prob, "suggested_improvements": []}
 
-                        # Find the features that significantly contribute to the prediction for the alternative crop
-                        alt_significant_features = None  # Initialize to None
+                        if cancel_prediction:
+                            cancel_prediction = False 
+                            return {"message": "Prediction canceled"}
 
-                        # Get feature importances using permutation importance
-                        perm_importance = permutation_importance(model, X_test, y_test, n_repeats=30, random_state=42)
-
-                        # Set feature_importances as a local variable
-                        alt_feature_importances = perm_importance.importances_mean
-
-                        # Feature names
+                        alt_significant_features = permutation_importance(model, X_test, y_test, n_repeats=30, random_state=42).importances_mean
                         feature_names = X_test.columns
 
-                        # Check if alt_feature_importances is not None before using it
-                        if alt_feature_importances is not None:
-                            # Find the features that significantly contribute to the prediction
-                            alt_significant_features = [(feature_names[i], alt_feature_importances[i]) for i, importance in enumerate(alt_feature_importances) if importance > 0]
+                        if alt_significant_features is not None:
+                            alt_significant_features = [(feature_names[i], alt_significant_features[i]) for i, importance in enumerate(alt_significant_features) if importance > 0]
 
-                        # Set alt_crop within the loop
                         alt_crop = alt_crop
 
                         if alt_significant_features:
-                            for feature, importance in alt_significant_features:
-                                # Calculate the average requirements from the dataset for each feature
-                                avg_requirements = X_train[X_train.index.isin(y_train[y_train == label_encoder.transform([alt_crop])[0]].index)].mean()
+                            for feature, _ in alt_significant_features:
+                                target_value = X_train[feature].mean()
+                                current_value = new_data[feature].values[0]
+                                improvement = calculate_improvements(current_value, target_value)
 
-                                # Add specific recommendations for each feature to the response
                                 response_data["alternative_crops"][alt_crop]["suggested_improvements"].append({
                                     "feature": feature,
-                                    "current_value": convert_np_int64_to_int(new_data[feature].values[0]),
-                                    "target_value": avg_requirements[feature] + 0.5  # You can adjust the multiplier as needed
+                                    "current_value": convert_np_int64_to_int(current_value),
+                                    "target_value": convert_np_int64_to_int(target_value),
+                                    "improvement": convert_np_int64_to_int(improvement)
                                 })
 
-                        else:
-                            response_data["alternative_crops"][alt_crop]["message"] = "No specific improvement recommendations."
+                            else:
+                                response_data["alternative_crops"][alt_crop]["message"] = "No specific improvement recommendations."
+
+                    # print("No alternative crops.")
 
                 else:
-                    response_data["message"] = "No alternative crops found with higher probability threshold."
+                    response_data["message"] = "No more alternative crops found with a higher probability threshold."
 
-            else:
-                response_data["message"] = "No feature importances available."
+            return response_data
 
-        else:
-            response_data["message"] = "Soil has suitable conditions for the above provided crops"
+        except Exception as e:
+            if cancel_prediction:
+                return {"message": "Prediction canceled"}
+            cancel_prediction = False  # Reset the flag in case of unexpected exceptions
+            return {"success": False, "message": str(e)}
 
-            # Check for alternative crops with higher probability threshold
-            alternative_crops = {crop: prob for crop, prob in crop_probabilities.items() if 0 < prob < 0.5}  # Exclude crops with prob >= 0.5
-
-            if alternative_crops:  # Check if alternative_crops is not empty
-                # Sort alternative crops based on probabilities in descending order
-                alternative_crops = dict(sorted(alternative_crops.items(), key=lambda item: item[1], reverse=True))
-                response_data["alternative_crops"] = {}
-
-                for alt_crop, alt_prob in alternative_crops.items():
-                    response_data["alternative_crops"][alt_crop] = {"probability": alt_prob, "suggested_improvements": []}
-
-                    # Find the features that significantly contribute to the prediction for the alternative crop
-                    alt_significant_features = None  # Initialize to None
-
-                    # Get feature importances using permutation importance
-                    perm_importance = permutation_importance(model, X_test, y_test, n_repeats=30, random_state=42)
-
-                    # Set feature_importances as a local variable
-                    alt_feature_importances = perm_importance.importances_mean
-
-                    # Feature names
-                    feature_names = X_test.columns
-
-                    # Check if alt_feature_importances is not None before using it
-                    if alt_feature_importances is not None:
-                        # Find the features that significantly contribute to the prediction
-                        alt_significant_features = [(feature_names[i], alt_feature_importances[i]) for i, importance in enumerate(alt_feature_importances) if importance > 0]
-
-                    # Set alt_crop within the loop
-                    alt_crop = alt_crop
-
-                    if alt_significant_features:
-                        for feature, importance in alt_significant_features:
-                            # Calculate the average requirements from the dataset for each feature
-                            avg_requirements = X_train[X_train.index.isin(y_train[y_train == label_encoder.transform([alt_crop])[0]].index)].mean()
-
-                            # Add specific recommendations for each feature to the response
-                            response_data["alternative_crops"][alt_crop]["suggested_improvements"].append({
-                                "feature": feature,
-                                "current_value": convert_np_int64_to_int(new_data[feature].values[0]),
-                                "target_value": avg_requirements[feature] + 0.5  # You can adjust the multiplier as needed
-                            })
-
-                    else:
-                        response_data["alternative_crops"][alt_crop]["message"] = "No specific improvement recommendations."
-
-                #print("No alternative crops.")
-
-            else:
-                response_data["message"] = "No more alternative crops found with higher probability threshold."
-        # Convert NumPy int64 to int for jsonify compatibility
-        response_data = {key: convert_np_int64_to_int(value) if key != 'improvements' else value for key, value in response_data.items()}
+@app.route('/predict', methods=['POST'])
+def predict():
+    try:
+        data = request.json.get('data')
+        result = perform_prediction(data)
+        return jsonify(result)
 
     except Exception as e:
         return jsonify({"error": str(e)})
+# New endpoint to get crop labels
+@app.route('/crop_labels', methods=['GET'])
+def get_crop_labels():
+    try:
+        crop_labels = label_encoder.classes_.tolist()
+        return jsonify({"crop_labels": crop_labels})
 
-    return jsonify(response_data)
+    except Exception as e:
+        return jsonify({"error": str(e)})
+# New endpoint to cancel prediction
+@app.route('/cancel', methods=['POST'])
+def cancel():
+    global cancel_prediction
+    cancel_prediction = True
+    return jsonify({"message": "Cancel request received"})
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
